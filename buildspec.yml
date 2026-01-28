@@ -1,0 +1,45 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 18
+      python: 3.11
+    commands:
+      - echo "Installing dependencies"
+      - pip3 install --upgrade pip
+      - pip3 install aws-sam-cli
+      - sam --version
+
+  pre_build:
+    commands:
+      - echo "Installing dependencies"
+      - cd src/handlers && npm ci && cd ../..
+      - npm ci
+      - echo "Running unit tests"
+      - npm run test:unit
+      - echo "Generating coverage report"
+      - npm run test:coverage      
+
+  build:
+    commands:
+      - echo "Building SAM application"
+      - sam build --use-container
+      - echo "Validating SAM template"
+      - sam validate
+
+  post_build:
+    commands:
+      - echo "Packaging for deployment"
+      - export ARTIFACT_BUCKET=${ARTIFACT_BUCKET:-order-processing-artifacts-$(aws sts get-caller-identity --query Account --output text)}
+      - sam package --output-template-file packaged.yaml --s3-bucket $ARTIFACT_BUCKET --s3-prefix ${ENVIRONMENT:-dev}
+      - echo "Package completed"
+
+artifacts:
+  files:
+    - packaged.yaml
+    - samconfig.toml
+
+cache:
+  paths:
+    - 'src/handlers/node_modules/**/*'

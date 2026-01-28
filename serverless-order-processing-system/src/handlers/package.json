@@ -1,0 +1,22 @@
+{
+  "name": "order-handlers",
+  "version": "1.0.0",
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.450.0",
+    "@aws-sdk/client-sns": "^3.450.0",
+    "@aws-sdk/client-sqs": "^3.450.0",
+    "@aws-sdk/client-cognito-identity-provider": "^3.450.0",
+    "@aws-sdk/lib-dynamodb": "^3.450.0",
+    "uuid": "^9.0.1",
+    "jsonwebtoken": "^9.0.2"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "@types/jest": "^29.5.0",
+    "aws-sdk-client-mock": "^3.0.0"
+  },
+  "scripts": {
+    "test": "jest"
+  }
+}
+

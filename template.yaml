@@ -1,0 +1,492 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Production Order Processing with Auth & Rate Limiting
+
+Globals:
+  Function:
+    Runtime: nodejs18.x
+    Timeout: 30
+    MemorySize: 512
+    Tracing: Active
+    Environment:
+      Variables:
+        ORDERS_TABLE: !Ref OrdersTable
+        ORDER_QUEUE_URL: !Ref OrderQueue
+        ORDER_TOPIC_ARN: !Ref OrderTopic
+        USER_POOL_ID: !Ref UserPool
+        LOG_LEVEL: INFO
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+Resources:
+  # ============================================
+  # AUTHENTICATION - COGNITO USER POOL
+  # ============================================
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub order-users-${Environment}
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: false
+        - Name: name
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub order-client-${Environment}
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+      PreventUserExistenceErrors: ENABLED
+      AccessTokenValidity: 1  # 1 hour
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30  # 30 days
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+
+  # Admin User for Testing
+  AdminUser:
+    Type: AWS::Cognito::UserPoolUser
+    Properties:
+      UserPoolId: !Ref UserPool
+      Username: admin@example.com
+      UserAttributes:
+        - Name: email
+          Value: admin@example.com
+        - Name: name
+          Value: Admin User
+        - Name: email_verified
+          Value: 'true'
+      DesiredDeliveryMediums:
+        - EMAIL
+
+  # ============================================
+  # API GATEWAY WITH AUTH & RATE LIMITING
+  # ============================================
+  OrderAPI:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub order-api-${Environment}
+      StageName: !Ref Environment
+      TracingEnabled: true
+      Cors:
+        AllowMethods: "'POST, GET, OPTIONS'"
+        AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+        AllowOrigin: "'*'"
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt UserPool.Arn
+          ApiKeyAuthorizer:
+            ApiKeyRequired: true
+      GatewayResponses:
+        UNAUTHORIZED:
+          StatusCode: 401
+          ResponseTemplates:
+            application/json: '{"message": "Unauthorized - Invalid or missing token"}'
+        THROTTLED:
+          StatusCode: 429
+          ResponseTemplates:
+            application/json: '{"message": "Rate limit exceeded. Please try again later."}'
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          LoggingLevel: INFO
+          DataTraceEnabled: true
+          MetricsEnabled: true
+          ThrottlingBurstLimit: 100  # Burst capacity
+          ThrottlingRateLimit: 50    # Steady-state rate
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiGatewayLogGroup.Arn
+        Format: '$context.requestId $context.authorizer.claims.sub $context.error.message'
+
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/apigateway/order-api-${Environment}
+      RetentionInDays: 7
+
+  # ============================================
+  # USAGE PLANS & API KEYS (Alternative Auth)
+  # ============================================
+  BasicUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: OrderAPIStage
+    Properties:
+      UsagePlanName: !Sub basic-plan-${Environment}
+      Description: Basic tier - 100 requests per day
+      ApiStages:
+        - ApiId: !Ref OrderAPI
+          Stage: !Ref Environment
+      Throttle:
+        BurstLimit: 20
+        RateLimit: 10
+      Quota:
+        Limit: 100
+        Period: DAY
+
+  PremiumUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: OrderAPIStage
+    Properties:
+      UsagePlanName: !Sub premium-plan-${Environment}
+      Description: Premium tier - 10000 requests per day
+      ApiStages:
+        - ApiId: !Ref OrderAPI
+          Stage: !Ref Environment
+      Throttle:
+        BurstLimit: 100
+        RateLimit: 50
+      Quota:
+        Limit: 10000
+        Period: DAY
+
+  # API Key for testing
+  TestApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Name: !Sub test-api-key-${Environment}
+      Description: Test API Key for development
+      Enabled: true
+
+  BasicUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref TestApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref BasicUsagePlan
+
+  # Stage needs to be explicitly created for usage plans
+  OrderAPIStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      StageName: !Ref Environment
+      RestApiId: !Ref OrderAPI
+      DeploymentId: !Ref OrderAPIDeployment
+
+  OrderAPIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - CreateOrderFunction
+    Properties:
+      RestApiId: !Ref OrderAPI
+
+  # ============================================
+  # LAMBDA FUNCTIONS
+  # ============================================
+  CreateOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub create-order-${Environment}
+      CodeUri: src/handlers/
+      Handler: create-order.handler
+      Description: Receives authenticated orders
+      Environment:
+        Variables:
+          USER_POOL_ID: !Ref UserPool
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt OrderQueue.QueueName
+        - DynamoDBWritePolicy:
+            TableName: !Ref OrdersTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - cognito-idp:GetUser
+                - cognito-idp:AdminGetUser
+              Resource: !GetAtt UserPool.Arn
+      Events:
+        # Endpoint with Cognito Auth
+        CreateOrderCognito:
+          Type: Api
+          Properties:
+            RestApiId: !Ref OrderAPI
+            Path: /orders
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+        # Endpoint with API Key Auth (alternative)
+        CreateOrderApiKey:
+          Type: Api
+          Properties:
+            RestApiId: !Ref OrderAPI
+            Path: /orders/api-key
+            Method: POST
+            Auth:
+              ApiKeyRequired: true
+      DeploymentPreference:
+        Type: Canary10Percent5Minutes
+        Alarms:
+          - !Ref CreateOrderErrorAlarm
+          - !Ref CreateOrderLatencyAlarm
+
+  ProcessOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub process-order-${Environment}
+      CodeUri: src/handlers/
+      Handler: process-order.handler
+      ReservedConcurrentExecutions: 10
+      Policies:
+        - SQSPollerPolicy:
+            QueueName: !GetAtt OrderQueue.QueueName
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt OrderTopic.TopicName
+      Events:
+        OrderQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt OrderQueue.Arn
+            BatchSize: 10
+            MaximumBatchingWindowInSeconds: 5
+      DeploymentPreference:
+        Type: Canary10Percent5Minutes
+        Alarms:
+          - !Ref ProcessOrderErrorAlarm
+
+  NotifyCustomerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub notify-customer-${Environment}
+      CodeUri: src/handlers/
+      Handler: notify-customer.handler
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ses:SendEmail
+              Resource: '*'
+      Events:
+        OrderEvent:
+          Type: SNS
+          Properties:
+            Topic: !Ref OrderTopic
+
+  # Get User Info Endpoint (for testing auth)
+  GetUserInfoFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub get-user-info-${Environment}
+      CodeUri: src/handlers/
+      Handler: get-user-info.handler
+      Environment:
+        Variables:
+          USER_POOL_ID: !Ref UserPool
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - cognito-idp:GetUser
+                - cognito-idp:AdminGetUser
+              Resource: !GetAtt UserPool.Arn
+      Events:
+        GetUserInfo:
+          Type: Api
+          Properties:
+            RestApiId: !Ref OrderAPI
+            Path: /user/info
+            Method: GET
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # ============================================
+  # SQS QUEUES
+  # ============================================
+  OrderQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub order-queue-${Environment}
+      VisibilityTimeout: 90
+      MessageRetentionPeriod: 345600
+      ReceiveMessageWaitTimeSeconds: 20
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OrderDLQ.Arn
+        maxReceiveCount: 3
+
+  OrderDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub order-dlq-${Environment}
+      MessageRetentionPeriod: 1209600
+
+  # ============================================
+  # SNS TOPIC
+  # ============================================
+  OrderTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub order-events-${Environment}
+      DisplayName: Order Processing Events
+
+  # ============================================
+  # DYNAMODB TABLE
+  # ============================================
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub orders-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+        - AttributeName: customerId
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: N
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: CustomerIndex
+          KeySchema:
+            - AttributeName: customerId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+  # ============================================
+  # CLOUDWATCH ALARMS
+  # ============================================
+  CreateOrderErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub create-order-errors-${Environment}
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CreateOrderFunction
+
+  CreateOrderLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub create-order-latency-${Environment}
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      ExtendedStatistic: p99
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CreateOrderFunction
+
+  ProcessOrderErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub process-order-errors-${Environment}
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ProcessOrderFunction
+
+  DLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub order-dlq-messages-${Environment}
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt OrderDLQ.QueueName
+
+  # Rate Limit Alarm
+  ApiThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub api-throttle-${Environment}
+      MetricName: Count
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 100
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub order-api-${Environment}
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint
+    Value: !Sub https://${OrderAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment}
+    Export:
+      Name: !Sub ${AWS::StackName}-ApiEndpoint
+
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub ${AWS::StackName}-UserPoolId
+
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref UserPoolClient
+    Export:
+      Name: !Sub ${AWS::StackName}-ClientId
+
+  ApiKeyId:
+    Description: API Key ID for testing
+    Value: !Ref TestApiKey
+    Export:
+      Name: !Sub ${AWS::StackName}-ApiKeyId
+
+  OrdersTableName:
+    Description: DynamoDB Table
+    Value: !Ref OrdersTable

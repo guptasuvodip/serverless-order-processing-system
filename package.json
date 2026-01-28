@@ -1,0 +1,24 @@
+{
+  "name": "order-processing-system",
+  "version": "1.0.0",
+  "description": "Production-grade order processing with authentication",
+  "scripts": {
+    "test": "jest",
+    "test:unit": "jest tests/unit",
+    "test:integration": "jest tests/integration",
+    "test:coverage": "jest --coverage",
+    "test:watch": "jest --watch",
+    "deploy:dev": "sam build && sam deploy --parameter-overrides Environment=dev",
+    "deploy:prod": "sam build && sam deploy --parameter-overrides Environment=prod",
+    "logs:create": "sam logs -n CreateOrderFunction --stack-name order-processing-dev --tail",
+    "logs:process": "sam logs -n ProcessOrderFunction --stack-name order-processing-dev --tail"
+  },
+  "keywords": ["serverless", "aws", "lambda", "api-gateway"],
+  "author": "Your Name",
+  "license": "MIT",
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "@types/jest": "^29.5.0"
+  }
+}
+
